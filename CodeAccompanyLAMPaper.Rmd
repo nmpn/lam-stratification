@@ -1,0 +1,515 @@
+---
+title: "LAMForPublication"
+author: "Saisakul CHernbumroong"
+date: "8 October 2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load required packages
+```{r}
+library(tidyverse)
+library(caret)
+library(missForest)
+library(ggplot2)
+library(rJava)
+library(RWeka)
+library(FSelector)
+library(mlbench)
+library(clusterCrit)
+library(MDAS)
+library(mice)
+library(FactoMineR)
+library(dplyr)
+library(gridExtra)
+library(dplyr)
+library(Hmisc)
+library(xtable)
+library(factoextra)
+library(ConsensusClusterPlus)
+library(cluster)
+```
+
+
+## Load data set
+```{r}
+#1) Load data
+raw = read.csv("LAM Key variables edited data August 17.csv", header = TRUE, na.strings = c("#N/A","") ,strip.white = TRUE)
+dim(raw)
+summary(raw)
+
+datatype = read.csv("Data type.csv", header = TRUE,strip.white = TRUE)
+dim(datatype)
+summary(datatype)
+
+#Check variables' names
+MDAS::checkVariableNames(raw, datatype$Parameter)
+
+
+# Reformat data 
+raw$SOB[is.na(raw$SOB)] = "0"
+raw$PTX.[is.na(raw$PTX.)] = "0"
+raw$other.resp[is.na(raw$other.resp)] = "0"
+raw$angiomyolipoma[is.na(raw$angiomyolipoma)] = "0"
+raw$other.non.resp[is.na(raw$other.non.resp)] = "0"
+raw$Screened[is.na(raw$Screened)] = "0"
+raw$None[is.na(raw$None)] = "0"
+
+raw$TSC[is.na(raw$TSC)] = "0"
+raw$AML.[is.na(raw$AML.)] = "0"
+raw$LYMPHATIC[is.na(raw$LYMPHATIC)] = "0"
+raw$pneumothorax[is.na(raw$pneumothorax)] = "0"
+
+#2) Check data validity
+#processed data to the correct type
+valid = correctType(raw, datatype$Type)
+
+checkValidity(valid, datatype$Type, showOnlyInvalid = F, saveToFile = T, 
+              fileName = paste("valid", as.character(Sys.Date()), sep = "-"))
+
+#Recode change 1-Yes, 0-No
+factor.class = which(sapply(valid, class) == "factor")
+for(col in factor.class)
+{
+  if(all(levels(valid[, col]) == c("0","1")))
+  {
+    valid[, col] = factor(ifelse(valid[, col] == "0", "No", ifelse(valid[, col] == "1", "Yes", NA)))
+  }
+}
+
+#for menopause only
+valid$menopause = as.character(valid$menopause)
+valid$menopause = factor(ifelse(valid[, "menopause"] == "No", 
+                                "Pre", "Post"))
+
+checkValidity(valid, datatype$Type, showOnlyInvalid = F, saveToFile = T, 
+              fileName = paste("valid", as.character(Sys.Date()), sep = "-"))
+
+#Only use data with definite outcome in the analysis
+#Dat is the data set with only defiite LAM outcomes
+dat = valid[valid$definite...probable == "d", ] 
+
+#Remove study code and definite outcome columns
+dat = dat[, -c(1:2)]
+```
+
+## Create patient characteristics summary
+```{r}
+col.id = which(sapply(dat, is.numeric))
+summary_table = matrix(0, nrow = 0, ncol = 7)
+for(i in col.id)
+{
+  summary_table = rbind.data.frame(summary_table, summary(dat[, i]))
+  summary_table[nrow(summary_table), 7] = sum(is.na(dat[, i]))
+}
+
+summary_table = cbind.data.frame("Variable" = colnames(dat)[col.id], summary_table)
+colnames(summary_table) = c("Variable", names(summary(dat[, i])))
+
+print(xtable(summary_table, caption = "Patients characteristics"), include.rownames = FALSE)
+
+```
+
+## Analyse missing data
+```{r}
+mis = missingAnalysis(dat)
+missing.values <- dat %>%
+  gather(key = "key", value = "val") %>%
+  mutate(isna = is.na(val)) %>%
+  group_by(key) %>%
+  mutate(total = n()) %>%
+  group_by(key, total, isna) %>%
+  summarise(num.isna = n()) %>%
+  mutate(pct = num.isna / total * 100)
+
+
+levels <-
+  (missing.values  %>% filter(isna == T) %>% arrange(desc(pct)))$key
+
+percentage.plot <- missing.values %>%
+  ggplot() +
+  geom_bar(aes(x = reorder(key, desc(pct)), 
+               y = pct, fill=isna), 
+           stat = 'identity', alpha=0.8) +
+  scale_x_discrete(limits = levels) +
+  scale_fill_manual(name = "", 
+                    values = c('steelblue', 'tomato3'), labels = c("Present", "Missing")) +
+  coord_flip() +
+  labs(title = "Percentage of missing values", x =
+         'Variable', y = "% of missing values")
+
+percentage.plot
+```
+
+
+## Investigate imputation techniques i.e. MICE+RF, RF, MICE
+```{r}
+seedno = 1574
+set.seed(seedno)
+
+mi.rf = mice(dat[, 1:25], defaultMethod = c("rf", "rf", "rf", "rf"), seed = seedno)
+
+MDAS::checkImpute(dat[, 1:25], mice::complete(mi.rf))
+
+im = missForest(dat[, 1:25])
+MDAS::checkImpute(dat[, 1:25], im$ximp)
+
+mi = mice(dat[, 1:25], seed = seedno)
+MDAS::checkImpute(dat[, 1:25], mice::complete(mi))
+```
+
+## Identify number of clusters
+
+```{r}
+set.seed(seedno)
+all.ca = c()
+ca.ca = c()
+for(i in 1:5)
+{
+  com = mice::complete(mi,i)
+  
+  res = FAMD(com[, 1:25], ncp = Inf, graph = F)
+  
+  ca = MDAS::clusterAnalysis(res$ind$coord, plot = F, repeated = 5)
+  ca.ca = rbind(ca.ca, ca$clust)
+  all.ca = rbind(all.ca,ca$best)
+}
+re = all.ca %>% group_by(Method) %>% summarise(mode(No.cluster, "all")[1])
+re
+write.csv(ca.ca, file = "IdentClust.csv")
+write.csv(all.ca, file = "IdentClustMajority.csv")
+
+all.ca = c()
+ca.ca = c()
+for(i in 1:5)
+{
+  com = mice::complete(mi,i)
+  
+  dt = daisy(com)
+  
+  ca = MDAS::clusterAnalysis(dt, diss = T, plot = F, repeated = 5)
+  ca.ca = rbind(ca.ca, ca$clust)
+  all.ca = rbind(all.ca,ca$best)
+}
+re = all.ca %>% group_by(Method) %>% summarise(mode(No.cluster, "all")[1])
+re
+
+# save results
+write.csv(ca.ca, file = "IdentClustDist.csv")
+write.csv(all.ca, file = "IdentClustDistMajority.csv")
+```
+
+## Here we look at the PCA results
+```{r}
+fviz_contrib(res, choice = "var", axes = 1, top = 10)
+fviz_screeplot(res, addlabels = TRUE, ylim = c(0, 5, 0))
+```
+
+
+## Identify number of cluster using Gap statistics with Kmean
+```{r}
+for(i in 1:5)
+{
+  com = mice::complete(mi,i)
+  
+  res = FAMD(com[, 1:25], ncp = Inf, graph = F)
+  plot(fviz_nbclust(res$ind$coord, kmeans, method = "gap"))
+}
+```
+
+## Identify number of cluster using Gap statistics with PAM
+```{r}
+for(i in 1:5)
+{
+  com = mice::complete(mi,i)
+  
+  res = FAMD(com[, 1:25], ncp = Inf, graph = F)
+  plot(fviz_nbclust(res$ind$coord, pam, method = "gap"))
+}
+```
+
+## Identify number of cluster using Gap statistics with Hierarchical + Kmean
+```{r}
+for(i in 1:5)
+{
+  com = mice::complete(mi,i)
+  
+  res = FAMD(com[, 1:25], ncp = Inf, graph = F)
+  plot(fviz_nbclust(res$ind$coord, hClustCon, method = "gap"))
+}
+```
+
+## Identify number of cluster using Gap statistics with Fuzzy C-mean
+```{r}
+for(i in 1:5)
+{
+  com = mice::complete(mi,i)
+  
+  res = FAMD(com[, 1:25], ncp = Inf, graph = F)
+  plot(fviz_nbclust(res$ind$coord, cmeans, method = "gap"))
+}
+
+```
+
+## Perform cluster analysis using the identified number of clusters
+```{r}
+com = mice::complete(mi,1)
+all.ca = clusterPlotAnalysis(com, k = 2, plot = T, use.PCA = T)
+for(i in 2:5)
+{
+  com = mice::complete(mi,i)
+  
+  cpa = MDAS::clusterPlotAnalysis(com, k = 2, plot = T, use.PCA = T)
+  all.ca = cbind(all.ca,cpa)
+}
+
+#save results
+write.csv(all.ca, file = "AllPatientscluster.csv")
+
+
+```
+
+
+
+```{r}
+#Here we reorder the cluster names as each clustering algorithm randomly assigns the cluster names.
+a= all.ca
+a = a[, -which(colnames(a) == "EM")]
+
+a$Kmeans = as.character(a$Kmeans)
+a$Kmeans[a$Kmeans == 2] = 22
+a$Kmeans[a$Kmeans == 1] = 2
+a$Kmeans[a$Kmeans == 22] = 1
+a$Kmeans = factor(a$Kmeans)
+
+a$Fuzzy = as.character(a$Fuzzy)
+a$Fuzzy[a$Fuzzy == 2] = 22
+a$Fuzzy[a$Fuzzy == 1] = 2
+a$Fuzzy[a$Fuzzy == 22] = 1
+a$Fuzzy = factor(a$Fuzzy)
+
+a$Kmeans.1 = as.character(a$Kmeans.1)
+a$Kmeans.1[a$Kmeans.1 == 2] = 22
+a$Kmeans.1[a$Kmeans.1 == 1] = 2
+a$Kmeans.1[a$Kmeans.1 == 22] = 1
+a$Kmeans.1 = factor(a$Kmeans.1)
+
+a$Fuzzy.1 = as.character(a$Fuzzy.1)
+a$Fuzzy.1[a$Fuzzy.1 == 2] = 22
+a$Fuzzy.1[a$Fuzzy.1 == 1] = 2
+a$Fuzzy.1[a$Fuzzy.1 == 22] = 1
+a$Fuzzy.1 = factor(a$Fuzzy.1)
+
+a$HCPC.2 = as.character(a$HCPC.2)
+a$HCPC.2[a$HCPC.2 == 2] = 22
+a$HCPC.2[a$HCPC.2 == 1] = 2
+a$HCPC.2[a$HCPC.2 == 22] = 1
+a$HCPC.2 = factor(a$HCPC.2)
+
+a$`H-Kmeans.2`= as.character(a$`H-Kmeans.2`)
+a$`H-Kmeans.2`[a$`H-Kmeans.2` == 2] = 22
+a$`H-Kmeans.2`[a$`H-Kmeans.2` == 1] = 2
+a$`H-Kmeans.2`[a$`H-Kmeans.2` == 22] = 1
+a$`H-Kmeans.2` = factor(a$`H-Kmeans.2`)
+
+a$`H-Fuzzy.2` = as.character(a$`H-Fuzzy.2`)
+a$`H-Fuzzy.2`[a$`H-Fuzzy.2` == 2] = 22
+a$`H-Fuzzy.2`[a$`H-Fuzzy.2` == 1] = 2
+a$`H-Fuzzy.2`[a$`H-Fuzzy.2` == 22] = 1
+a$`H-Fuzzy.2` = factor(a$`H-Fuzzy.2`)
+
+a$Kmeans.2 = as.character(a$Kmeans.2)
+a$Kmeans.2[a$Kmeans.2 == 2] = 22
+a$Kmeans.2[a$Kmeans.2 == 1] = 2
+a$Kmeans.2[a$Kmeans.2 == 22] = 1
+a$Kmeans.2 = factor(a$Kmeans.2)
+
+a$Hierarchical.2 = as.character(a$Hierarchical.2)
+a$Hierarchical.2[a$Hierarchical.2 == 2] = 22
+a$Hierarchical.2[a$Hierarchical.2 == 1] = 2
+a$Hierarchical.2[a$Hierarchical.2 == 22] = 1
+a$Hierarchical.2 = factor(a$Hierarchical.2)
+
+a$HCPC.3 = as.character(a$HCPC.3)
+a$HCPC.3[a$HCPC.3 == 2] = 22
+a$HCPC.3[a$HCPC.3 == 1] = 2
+a$HCPC.3[a$HCPC.3 == 22] = 1
+a$HCPC.3 = factor(a$HCPC.3)
+
+a$HCPC.4 = as.character(a$HCPC.4)
+a$HCPC.4[a$HCPC.4 == 2] = 22
+a$HCPC.4[a$HCPC.4 == 1] = 2
+a$HCPC.4[a$HCPC.4 == 22] = 1
+a$HCPC.4 = factor(a$HCPC.4)
+
+a$Fuzzy.4 = as.character(a$Fuzzy.4)
+a$Fuzzy.4[a$Fuzzy.4 == 2] = 22
+a$Fuzzy.4[a$Fuzzy.4 == 1] = 2
+a$Fuzzy.4[a$Fuzzy.4 == 22] = 1
+a$Fuzzy.4 = factor(a$Fuzzy.4)
+
+final.cluster = factor(apply(a, 1, mode))
+```
+
+#Get cluster descriptions and profile plots on imputed data sets.
+```{r}
+for(i in 1:5)
+{
+  com = mice::complete(mi,i)
+  plotClusterProfile(com, final.cluster)
+  getClusterDesc(com[!is.na(final.cluster),], final.cluster[!is.na(final.cluster)])
+}
+
+```
+
+
+```{r}
+#save results
+g = list()
+for(i in 1:5)
+{
+  com = mice::complete(mi,i)
+  g[[i]] = plotHeatmapGroup(com[, sapply(com, is.numeric)], final.cluster) + ggtitle(paste("Imputation set", i))
+}
+do.call(grid.arrange, g)
+for(i in 1:5)
+{
+com = mice::complete(mi,i)
+cd = getClusterDesc(com[!is.na(final.cluster),], final.cluster[!is.na(final.cluster)])
+write.csv(cd$numerical$cluster.1, file = paste0("numericalclusterdesc1_im", i,".csv"))
+write.csv(cd$numerical$cluster.2, file = paste0("numericalclusterdesc2_im", i,".csv"))
+write.csv(cd$categorical$cluster.1, file = paste0("categoricalclusterdesc1_im", i,".csv"))
+write.csv(cd$categorical$cluster.2, file = paste0("categoricalclusterdesc2_im", i,".csv"))
+write.csv(cd$desc, file = paste0("overallclusterdesc_im", i, ".csv"))
+}
+```
+
+## Perform biomarker identification
+```{r}
+fss = list()
+for(i in 1:5)
+{
+  com = mice::complete(mi,i)
+  fs = fsAnalysis(com[!is.na(final.cluster),], final.cluster[!is.na(final.cluster)])
+  fss[[i]] = fs  
+}
+
+```
+
+```{r}
+
+#Analyse feature selection results
+
+re.fs = c()
+
+for(i in 1:5)
+{
+  
+  fs1 = fss[[i]]
+    
+  d = data.frame("Imputation" = i,
+                 "Method" = "REF+NB",
+             "No.Of.Selelected.Feature" = fs1$RFE$bestSubset,
+             "Accuracy" = fs1$RFE$results$Accuracy[fs1$RFE$bestSubset],
+             "AccuracySD" = fs1$RFE$results$AccuracySD[fs1$RFE$bestSubset],
+             "Kappa" = fs1$RFE$results$Kappa[fs1$RFE$bestSubset],
+             "KappaSD" = fs1$RFE$results$KappaSD[fs1$RFE$bestSubset])
+  
+  e = data.frame("Imputation" = i,
+                 "Method" = "CFS+NB",
+             "No.Of.Selelected.Feature" = fs1$CFS$no.selectedFeature,
+             "Accuracy" = fs1$CFS$results$Accuracy[fs1$CFS$no.selectedFeature],
+             "AccuracySD" = fs1$CFS$results$AccuracySD[fs1$CFS$no.selectedFeature],
+             "Kappa" = fs1$CFS$results$Kappa[fs1$CFS$no.selectedFeature],
+             "KappaSD" = fs1$CFS$results$KappaSD[fs1$CFS$no.selectedFeature])
+  
+  f = data.frame("Imputation" = i,
+                 "Method" = "MRMR+NB",
+             "No.Of.Selelected.Feature" = fs1$MRMR$no.selectedFeature,
+             "Accuracy" = fs1$MRMR$results$Accuracy[fs1$MRMR$no.selectedFeature],
+             "AccuracySD" = fs1$MRMR$results$AccuracySD[fs1$MRMR$no.selectedFeature],
+             "Kappa" = fs1$MRMR$results$Kappa[fs1$MRMR$no.selectedFeature],
+             "KappaSD" = fs1$MRMR$results$KappaSD[fs1$MRMR$no.selectedFeature])
+  
+  re.fs = rbind.data.frame(re.fs, d, e, f) 
+  
+}
+
+```
+
+
+## Analyse and combine biomarker selected from RFE in imputed data sets
+```{r}
+
+re.s = c()
+
+for(i in 1:5)
+{
+  
+  fs1 = fss[[i]]
+    
+  re.s = c(re.s, fs1$RFE$optVariables)
+}
+
+d = data.frame(summary(factor(re.s)))
+d = cbind.data.frame(rownames(d), d)
+colnames(d) = c("Variable", "Count")
+
+d = d[order(d$Count, decreasing = T),]
+
+sl = as.character(d[d$Count == 5, "Variable"])
+save(sl, file = "selectedfeature")
+
+```
+
+
+## Perform machine learning analysis 
+```{r}
+#combine data sets
+comdf = c()
+outdf = c()
+
+for(i in 1:5)
+{
+  comdf = rbind.data.frame(comdf, mice::complete(mi, i))
+  outdf = c(outdf, final.cluster)
+}
+
+df = cbind.data.frame(comdf, outdf)
+
+df = df[complete.cases(df), ]
+
+df$outdf = factor(paste0("Cluster", df$outdf))
+
+ml = mlAnalysis(df[, sl], df$outdf, nfold = 5, nrun = 10)
+
+#save models
+save(ml, file = "MLwithmissingFS")
+
+```
+
+
+```{r}
+#model results
+allm = rbind.data.frame(sapply(mm[mm$metric == "LogLoss",], mean),
+                 sapply(mm[mm$metric == "AUC",], mean),
+                 sapply(mm[mm$metric == "prAUC",], mean),
+                 sapply(mm[mm$metric == "Accuracy",], mean),
+                 sapply(mm[mm$metric == "Kappa",], mean),
+                 sapply(mm[mm$metric == "F1",], mean),
+                 sapply(mm[mm$metric == "Sensitivity",], mean),
+                 sapply(mm[mm$metric == "Specificity",], mean),
+                 sapply(mm[mm$metric == "Pos_Pred_Value",], mean),
+                 sapply(mm[mm$metric == "Neg_Pred_Value",], mean),
+                 sapply(mm[mm$metric == "Precision",], mean),
+                 sapply(mm[mm$metric == "Recall",], mean),
+                 sapply(mm[mm$metric == "Detection_Rate",], mean),
+                 sapply(mm[mm$metric == "Balanced_Accuracy",], mean))
+                 
+
+```
+
+
